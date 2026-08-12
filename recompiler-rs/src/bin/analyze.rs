@@ -471,8 +471,9 @@ fn summarize(
         let insn = &decoded.insn;
         let site = insn.addr & 0xFFFFFF;
         pcs.push(site);
-        if (insn.mnem == "BRK" || insn.mnem == "COP") && !graph.data_region_exec_pcs.contains(&site)
-        {
+        // COP tiers to the interpreter (see lowering::_h_cop) and is M/X-
+        // transparent, so it is a modelled call, not poison. BRK is not.
+        if insn.mnem == "BRK" && !graph.data_region_exec_pcs.contains(&site) {
             poison_reasons.insert(format!("{}_at_{site:06X}", insn.mnem.to_ascii_lowercase()));
         }
         if let Some(entries) = &insn.dispatch_entries {
@@ -1229,7 +1230,7 @@ fn analyze(
                 .any(|reason| reason == "structural_poison");
             let fact_key = (key.pc24, key.m, key.x);
             let graph_has_poison = graph.insns().iter().any(|decoded| {
-                matches!(decoded.insn.mnem, "BRK" | "COP")
+                decoded.insn.mnem == "BRK"
                     && !graph
                         .data_region_exec_pcs
                         .contains(&(decoded.insn.addr & 0xFFFFFF))
@@ -1257,7 +1258,7 @@ fn analyze(
                     }));
                     if let Ok(probe) = probe {
                         let probe_has_poison = probe.insns().iter().any(|decoded| {
-                            matches!(decoded.insn.mnem, "BRK" | "COP")
+                            decoded.insn.mnem == "BRK"
                                 && !probe
                                     .data_region_exec_pcs
                                     .contains(&(decoded.insn.addr & 0xFFFFFF))
