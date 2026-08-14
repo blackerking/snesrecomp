@@ -115,6 +115,7 @@ struct Inputs {
     inline_skip: HashMap<u32, i32>,
     terminal_jsr_sites: BTreeSet<u32>,
     declared_exit_modes: HashMap<(u32, u8, u8), (u8, u8)>,
+    declared_exit_sets: HashMap<(u32, u8, u8), Vec<(u8, u8)>>,
     /// Synthetic reloc regions redirecting WRAM ram_routine entries to blob
     /// bytes appended to the ROM image (plus any cfg `reloc` directives).
     reloc_regions: Vec<RelocRegion>,
@@ -254,6 +255,7 @@ fn load_inputs(cfg_dir: &Path, rom: &mut Vec<u8>, all_cfg_roots: bool) -> Result
     let mut inline_skip = HashMap::new();
     let mut terminal_jsr_sites = BTreeSet::new();
     let mut declared_exit_modes = HashMap::new();
+    let mut declared_exit_sets: HashMap<(u32, u8, u8), Vec<(u8, u8)>> = HashMap::new();
 
     for (index, cfg) in cfgs.iter().enumerate() {
         let bank = cfg.bank as u32 & 0xFF;
@@ -336,6 +338,17 @@ fn load_inputs(cfg_dir: &Path, rom: &mut Vec<u8>, all_cfg_roots: bool) -> Result
                 declared_exit_modes.insert((resolved, m & 1, x & 1), (exit_m & 1, exit_x & 1));
             }
         }
+        // Multi-exit callees. Kept out of `declared_exit_modes` deliberately:
+        // that map is single-valued, and a set is not a stronger version of an
+        // exact fact -- it is a different one. It seeds `active_sets`, which
+        // the decoder forks the post-call continuation on.
+        for (exit_bank, pc, m, x, exits) in &cfg.exit_mx_set {
+            let target = ((*exit_bank as u32) << 16) | (pc & 0xFFFF);
+            let modes: Vec<(u8, u8)> = exits.iter().map(|&(em, ex)| (em & 1, ex & 1)).collect();
+            for resolved in [Some(target), mirror_pc24(target)].into_iter().flatten() {
+                declared_exit_sets.insert((resolved, m & 1, x & 1), modes.clone());
+            }
+        }
         let mut hle_entries: BTreeSet<u32> = cfg.hle_func.keys().copied().collect();
         hle_entries.extend(cfg.hle_spc_upload.iter().copied());
         for pc in hle_entries {
@@ -405,6 +418,7 @@ fn load_inputs(cfg_dir: &Path, rom: &mut Vec<u8>, all_cfg_roots: bool) -> Result
         inline_skip,
         terminal_jsr_sites,
         declared_exit_modes,
+        declared_exit_sets,
         reloc_regions,
     })
 }
@@ -1009,7 +1023,8 @@ fn analyze(
 > {
     let mapping = detect_rom_mapping(rom);
     let mut active_exact = inputs.declared_exit_modes.clone();
-    let mut active_sets: HashMap<(u32, u8, u8), Vec<(u8, u8)>> = HashMap::new();
+    let mut active_sets: HashMap<(u32, u8, u8), Vec<(u8, u8)>> =
+        inputs.declared_exit_sets.clone();
     let mut unstable_exact = HashSet::new();
     let mut unstable_sets = HashSet::new();
     let mut poisoned = HashSet::new();
@@ -1352,6 +1367,12 @@ fn analyze(
             }
             match next_exact.get(&key).copied() {
                 None => {
+                    // A cfg-declared set is authoritative; an inferred exact
+                    // fact must not silently replace it, or the extra proven
+                    // continuation is lost.
+                    if inputs.declared_exit_sets.contains_key(&key) {
+                        continue;
+                    }
                     next_exact.insert(key, pair);
                     active_sets.remove(&key);
                 }
@@ -1364,7 +1385,10 @@ fn analyze(
         }
         let mut next_sets = active_sets.clone();
         for (key, modes) in round_sets {
-            if unstable_sets.contains(&key) || inputs.declared_exit_modes.contains_key(&key) {
+            if unstable_sets.contains(&key)
+                || inputs.declared_exit_modes.contains_key(&key)
+                || inputs.declared_exit_sets.contains_key(&key)
+            {
                 continue;
             }
             // New callee facts can expose an additional return path that was
@@ -1422,7 +1446,13 @@ fn analyze(
                 .reasons
                 .iter()
                 .any(|reason| reason == "unproven_callee_exit" || reason == "structural_poison");
+            // A cfg-declared exit -- exact or set -- is an assertion by the
+            // author and outranks the analyzer's own inability to see the
+            // body. Without the `declared_exit_sets` arm a declared set is
+            // dropped for exactly the callees it exists to describe: ones the
+            // solver truncated and therefore could never derive an exit for.
             if !inputs.declared_exit_modes.contains_key(&fact_key)
+                && !inputs.declared_exit_sets.contains_key(&fact_key)
                 && ((truncated && !recursive_nonempty_solution_keys.contains(&fact_key))
                     || (unresolved && !recursive_solution_keys.contains(&fact_key)))
             {
