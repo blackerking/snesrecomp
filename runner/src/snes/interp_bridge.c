@@ -63,6 +63,13 @@ static uint64_t bridge_bounce_flush_thresh(void) {
     return (uint64_t)s_t;
 }
 static void bridge_apu_flush(CpuState *cpu) {
+    /* SNESRECOMP_INTERP_NOAPU=1: skip the bridge's APU catch-up entirely.
+     * Bisection aid for hosts that drive the SPC themselves -- if a run that
+     * hangs inside a single interpreted step completes with this set, the APU
+     * path is the hang and the two sides are both trying to own the clock. */
+    { static int noapu = -1;
+      if (noapu < 0) noapu = getenv("SNESRECOMP_INTERP_NOAPU") ? 1 : 0;
+      if (noapu) { s_apu_pending_master = 0; return; } }
     if (!s_apu_pending_master) return;
     /* RtlRunFrame's absolute guest-cycle clock and this legacy relative
      * catch-up describe the same elapsed time. Running both made interpreted
@@ -334,6 +341,7 @@ static int      s_lle_unwind_active = 0;
 static uint32_t s_lle_unwind_pc24   = 0;
 static int      s_lle_unwind_owner_depth = 0;
 static uint32_t s_lle_resume_pc24   = 0;
+static int      s_interp_pctrace    = 0;
 static int      s_lle_wai_yield     = 0;
 static uint64_t s_lle_master_deadline = 0;
 /* Depth of nested interpreter runs and the run that owns the current paired
@@ -750,7 +758,8 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
          * returns, where the question is simply "where is it". */
         { static long pct = -1;
           if (pct < 0) { const char *e = getenv("SNESRECOMP_INTERP_PCTRACE");
-                         pct = e ? atol(e) : 0; if (pct < 0) pct = 0; }
+                         pct = e ? atol(e) : 0; if (pct < 0) pct = 0;
+                         s_interp_pctrace = pct != 0; }
           if (pct && (steps % pct) == 0)
             fprintf(stderr, "[pctrace] step=%ld pc=%06X op=%02X\n", steps,
                     (unsigned)pc_before, bridge_bus_read(cpu, pc_before)); }
@@ -1128,7 +1137,13 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             sync_interp_to_cpu(&in, cpu);
         }
         cpu->coprocessor_master_cycles = cpu->master_cycles;
+        if (s_interp_pctrace && steps < 4)
+            fprintf(stderr, "[pctrace] step=%ld pre-runOpcode pc=%06X\n",
+                    steps, (unsigned)pc_before);
         int _cyc = interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
+        if (s_interp_pctrace && steps < 4)
+            fprintf(stderr, "[pctrace] step=%ld post-runOpcode cyc=%d pc=%02X:%04X\n",
+                    steps, _cyc, in.k, in.pc);
         s_interp_bus_timing_active=0;
         if (dtrace && in.dp != dp_before) {
             extern int snes_frame_counter;
