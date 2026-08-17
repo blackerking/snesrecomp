@@ -431,6 +431,28 @@ void interp_bridge_set_master_deadline(uint64_t master_clock) {
 }
 
 int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
+    /* SNESRECOMP_DEADLINE_DIAG=1: report why the bound is not firing.
+     *
+     * Every generated block polls this, so a host that arms a deadline and
+     * still hangs has no way to tell whether the deadline was never reached or
+     * whether one of the two depth guards is zero -- the guards are file-static
+     * and invisible from outside. Rate-limited to a handful of lines. */
+    if (cpu && s_lle_master_deadline != 0 &&
+        cpu->master_cycles >= s_lle_master_deadline &&
+        !(s_lle_sched_depth > 0 && s_interp_bounce_owner_depth > 0)) {
+        static int diag_n = -1;
+        if (diag_n < 0) diag_n = getenv("SNESRECOMP_DEADLINE_DIAG") ? 0 : 1000;
+        if (diag_n < 8) {
+            diag_n++;
+            fprintf(stderr,
+                    "[deadline_diag] past deadline but suppressed: "
+                    "sched_depth=%d bounce_owner_depth=%d master=%llu "
+                    "deadline=%llu\n",
+                    s_lle_sched_depth, s_interp_bounce_owner_depth,
+                    (unsigned long long)cpu->master_cycles,
+                    (unsigned long long)s_lle_master_deadline);
+        }
+    }
     return cpu && s_lle_sched_depth > 0 && s_interp_bounce_owner_depth > 0 &&
            s_lle_master_deadline != 0 &&
            cpu->master_cycles >= s_lle_master_deadline;
@@ -723,6 +745,15 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     uint64_t progress_dynamic_epoch=s_interp_dynamic_progress_epoch;
     for (; steps < step_cap; steps++) {
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
+        /* SNESRECOMP_INTERP_PCTRACE=N: print the PC every N steps. For the case
+         * the bail-time trace cannot reach -- a run that never bails and never
+         * returns, where the question is simply "where is it". */
+        { static long pct = -1;
+          if (pct < 0) { const char *e = getenv("SNESRECOMP_INTERP_PCTRACE");
+                         pct = e ? atol(e) : 0; if (pct < 0) pct = 0; }
+          if (pct && (steps % pct) == 0)
+            fprintf(stderr, "[pctrace] step=%ld pc=%06X op=%02X\n", steps,
+                    (unsigned)pc_before, bridge_bus_read(cpu, pc_before)); }
 #if SNESRECOMP_REVERSE_DEBUG
         /* The reverse debugger must observe whichever execution tier owns the
          * next guest instruction. AOT blocks arrive through cpu_trace_block;
