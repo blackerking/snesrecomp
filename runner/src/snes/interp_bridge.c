@@ -165,6 +165,15 @@ static uint8_t bridge_bus_read(void *mem, uint32_t adr) {
     return value;
 }
 static void bridge_bus_write(void *mem, uint32_t adr, uint8_t val) {
+    /* SNESRECOMP_REGWRITE_DIAG=1: announce every hardware-register write
+     * BEFORE it is issued. For a bus access that does not return, the last
+     * line printed names the register that blocked. */
+    { static int rwd = -1;
+      if (rwd < 0) rwd = getenv("SNESRECOMP_REGWRITE_DIAG") ? 1 : 0;
+      if (rwd) { uint16_t a16 = (uint16_t)(adr & 0xFFFF);
+        if (a16 >= 0x2100 && a16 <= 0x43FF)
+          fprintf(stderr, "[regwrite] -> $%04X = %02X\n", (unsigned)a16,
+                  (unsigned)val); } }
     bridge_timing_bus(adr);
     g_interp_bridge_write_epoch++;
     CpuState *cpu = (CpuState *)mem;
@@ -175,6 +184,11 @@ static void bridge_bus_write(void *mem, uint32_t adr, uint8_t val) {
     }
     if (bridge_is_apu_port(adr)) bridge_apu_flush(cpu);
     cpu_write8(cpu, (uint8)((adr >> 16) & 0xFF), (uint16)(adr & 0xFFFF), val);
+    { static int rwd2 = -1;
+      if (rwd2 < 0) rwd2 = getenv("SNESRECOMP_REGWRITE_DIAG") ? 1 : 0;
+      if (rwd2) { uint16_t a16 = (uint16_t)(adr & 0xFFFF);
+        if (a16 >= 0x2100 && a16 <= 0x43FF)
+          fprintf(stderr, "[regwrite]    $%04X done\n", (unsigned)a16); } }
 }
 
 /* Word bus (interp816 read_word/write_word): claim a CONTIGUOUS pair that
@@ -479,10 +493,14 @@ int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
         if (fired < 0) fired = getenv("SNESRECOMP_DEADLINE_DIAG") ? 0 : 1000;
         if (fired < 4) { fired++;
           fprintf(stderr, "[deadline_diag] FIRED master=%llu deadline=%llu "
-                  "sched=%d bounce=%d\n",
+                  "sched=%d bounce=%d S=%04X X=%04X Y=%04X "
+                  "DB=%02X D=%04X PB=%02X m=%u x=%u\n",
                   (unsigned long long)cpu->master_cycles,
                   (unsigned long long)s_lle_master_deadline,
-                  s_lle_sched_depth, s_interp_bounce_owner_depth); } }
+                  s_lle_sched_depth, s_interp_bounce_owner_depth,
+                  (unsigned)cpu->S, (unsigned)cpu->X, (unsigned)cpu->Y,
+                  (unsigned)cpu->DB, (unsigned)cpu->D, (unsigned)cpu->PB,
+                  (unsigned)cpu->m_flag, (unsigned)cpu->x_flag); } }
       return hit; }
 }
 
