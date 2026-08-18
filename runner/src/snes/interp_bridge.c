@@ -372,6 +372,13 @@ static uint64_t s_lle_master_deadline = 0;
  * owning interpreter's guest call chain. */
 static int      s_interp_bridge_depth = 0;
 static int      s_interp_bounce_owner_depth = 0;
+/* Count of AOT bodies entered through the paired ABI. Exposed so a host
+ * can tell a genuinely-compiled run from one that quietly interpreted
+ * everything -- without it, a wall-clock tier comparison is unreadable. */
+unsigned long long g_interp_bridge_bounces = 0;
+/* Opcodes the bridge INTERPRETED. Together with the bounce count this says
+ * how much of a run the AOT tier is actually carrying. */
+unsigned long long g_interp_bridge_steps = 0;
 /* Architectural stack boundary of the currently active interpreter frame.
  * A rewritten AOT return that has already popped above this boundary belongs
  * to a compiled ancestor, not to this interpreter's guest call chain. */
@@ -1204,6 +1211,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             unsigned _internal = (unsigned)_cyc > s_interp_bus_cycles
                                ? (unsigned)_cyc - s_interp_bus_cycles : 0;
             uint64_t _master = s_interp_bus_master + (uint64_t)_internal * 6u;
+            g_interp_bridge_steps++;
             cpu->cycles        += (uint64_t)_cyc;
             cpu->master_cycles += _master;
             cpu->coprocessor_master_cycles = cpu->master_cycles;
@@ -1351,6 +1359,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 int _saved_bounce_owner = s_interp_bounce_owner_depth;
                 s_interp_bounce_recomp_base = g_recomp_stack_top;
                 s_interp_bounce_owner_depth = s_interp_bridge_depth;
+                g_interp_bridge_bounces++;
                 RecompReturn _air = cpu_dispatch_pc_paired(cpu, target, _fs);
                 s_interp_bounce_owner_depth = _saved_bounce_owner;
                 s_interp_bounce_recomp_base = _saved_bounce_base;
