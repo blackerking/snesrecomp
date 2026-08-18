@@ -461,9 +461,19 @@ int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
                     (unsigned long long)s_lle_master_deadline);
         }
     }
-    return cpu && s_lle_sched_depth > 0 && s_interp_bounce_owner_depth > 0 &&
-           s_lle_master_deadline != 0 &&
-           cpu->master_cycles >= s_lle_master_deadline;
+    { const int hit = cpu && s_lle_sched_depth > 0 &&
+                      s_interp_bounce_owner_depth > 0 &&
+                      s_lle_master_deadline != 0 &&
+                      cpu->master_cycles >= s_lle_master_deadline;
+      if (hit) { static int fired = -1;
+        if (fired < 0) fired = getenv("SNESRECOMP_DEADLINE_DIAG") ? 0 : 1000;
+        if (fired < 4) { fired++;
+          fprintf(stderr, "[deadline_diag] FIRED master=%llu deadline=%llu "
+                  "sched=%d bounce=%d\n",
+                  (unsigned long long)cpu->master_cycles,
+                  (unsigned long long)s_lle_master_deadline,
+                  s_lle_sched_depth, s_interp_bounce_owner_depth); } }
+      return hit; }
 }
 
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
