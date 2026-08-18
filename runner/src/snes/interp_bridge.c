@@ -340,6 +340,15 @@ static int      s_lle_sched_depth   = 0;
 static int      s_lle_unwind_active = 0;
 static uint32_t s_lle_unwind_pc24   = 0;
 static int      s_lle_unwind_owner_depth = 0;
+/* Why the pending unwind was raised. A yield primitive (vblank wait, task
+ * switch) wants the interpreter to resume at the primitive's ROM entry and
+ * carry on -- that is the historic behaviour. A master-deadline expiry wants
+ * the opposite: the host asked for a time bound, so control has to leave the
+ * bridge entirely, or the host can never re-arm and the bound fires forever
+ * on every subsequent bounce. Both arrive through the same
+ * interp_bridge_lle_yield_unwind() sentinel, so the cause has to be recorded
+ * where it is known. */
+static int      s_lle_unwind_from_deadline = 0;
 static uint32_t s_lle_resume_pc24   = 0;
 static int      s_interp_pctrace    = 0;
 static int      s_lle_wai_yield     = 0;
@@ -465,7 +474,8 @@ int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
                       s_interp_bounce_owner_depth > 0 &&
                       s_lle_master_deadline != 0 &&
                       cpu->master_cycles >= s_lle_master_deadline;
-      if (hit) { static int fired = -1;
+      if (hit) { s_lle_unwind_from_deadline = 1;
+        static int fired = -1;
         if (fired < 0) fired = getenv("SNESRECOMP_DEADLINE_DIAG") ? 0 : 1000;
         if (fired < 4) { fired++;
           fprintf(stderr, "[deadline_diag] FIRED master=%llu deadline=%llu "
@@ -1359,6 +1369,23 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                              * switch runs byte-exact. */
                             s_lle_unwind_active = 0;
                             s_lle_unwind_owner_depth = 0;
+                            if (s_lle_unwind_from_deadline && yield_pc &&
+                                !auto_quiescent) {
+                                /* Deadline expiry in scheduler mode: return
+                                 * to the host instead of resuming here, and
+                                 * publish the primitive entry as the resume
+                                 * point so the next call continues exactly
+                                 * where this one stopped. Without this the
+                                 * bridge resumes interpreting with the bound
+                                 * still expired, so the next bounce unwinds
+                                 * again and the host never regains control. */
+                                s_lle_unwind_from_deadline = 0;
+                                s_lle_resume_pc24 = s_lle_unwind_pc24;
+                                sync_interp_to_cpu(&in, cpu);
+                                bridge_apu_flush(cpu);
+                                return 1;
+                            }
+                            s_lle_unwind_from_deadline = 0;
                             sync_cpu_to_interp(cpu, &in);
                             in.k  = (uint8)((s_lle_unwind_pc24 >> 16) & 0xFF);
                             in.pc = (uint16)(s_lle_unwind_pc24 & 0xFFFF);
