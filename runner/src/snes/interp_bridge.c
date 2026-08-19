@@ -379,6 +379,29 @@ unsigned long long g_interp_bridge_bounces = 0;
 /* Opcodes the bridge INTERPRETED. Together with the bounce count this says
  * how much of a run the AOT tier is actually carrying. */
 unsigned long long g_interp_bridge_steps = 0;
+
+/* Optional host coverage hooks. Both are NULL by default and cost one
+ * predictable branch when unset.
+ *
+ * A host that drives the guest through run_loop cannot see executed PCs the
+ * way a per-opcode host can, so any executed-PC bitmap it keeps is empty --
+ * which silently invalidates every coverage tool built on one.
+ *
+ * The two hooks are deliberately NOT interchangeable:
+ *
+ *   pc_hook     fires once per INTERPRETED opcode, with the architectural PC
+ *               and the live widths. Exact.
+ *   bounce_hook fires once per compiled body ENTERED, with its entry PC and
+ *               entry widths. This is an entry, not an extent: a compiled body
+ *               executes an unknown number of opcodes without reporting them.
+ *
+ * A host must not treat a bounce as coverage of the body interior. Manifest
+ * min_pc24/max_pc24 will not fill that gap either -- those bounds swallow
+ * nested routines and stop short of a truncated one, so expanding them
+ * manufactures coverage that was never executed. Report entered variants
+ * separately and join them by key instead. */
+void (*g_interp_bridge_pc_hook)(uint32_t pc24, int m_flag, int x_flag) = 0;
+void (*g_interp_bridge_bounce_hook)(uint32_t pc24, int m_flag, int x_flag) = 0;
 /* Architectural stack boundary of the currently active interpreter frame.
  * A rewritten AOT return that has already popped above this boundary belongs
  * to a compiled ancestor, not to this interpreter's guest call chain. */
@@ -1185,6 +1208,9 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         if (s_interp_pctrace && steps < 4)
             fprintf(stderr, "[pctrace] step=%ld pre-runOpcode pc=%06X\n",
                     steps, (unsigned)pc_before);
+        if (g_interp_bridge_pc_hook)
+            g_interp_bridge_pc_hook(pc_before & 0xFFFFFFu,
+                                    in.mf ? 1 : 0, in.xf ? 1 : 0);
         int _cyc = interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
         if (s_interp_pctrace && steps < 4)
             fprintf(stderr, "[pctrace] step=%ld post-runOpcode cyc=%d pc=%02X:%04X\n",
@@ -1360,6 +1386,10 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 s_interp_bounce_recomp_base = g_recomp_stack_top;
                 s_interp_bounce_owner_depth = s_interp_bridge_depth;
                 g_interp_bridge_bounces++;
+                if (g_interp_bridge_bounce_hook)
+                    g_interp_bridge_bounce_hook(target & 0xFFFFFFu,
+                                                cpu->m_flag ? 1 : 0,
+                                                cpu->x_flag ? 1 : 0);
                 RecompReturn _air = cpu_dispatch_pc_paired(cpu, target, _fs);
                 s_interp_bounce_owner_depth = _saved_bounce_owner;
                 s_interp_bounce_recomp_base = _saved_bounce_base;
