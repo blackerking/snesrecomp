@@ -43,6 +43,8 @@ extern "C" {
 #endif
 
 typedef void (*SNESModActivationCallback)(void);
+typedef void (*SNESModFrameCallback)(void);
+typedef int (*SNESModApuWriteCallback)(uint16_t reg, uint8_t value);
 
 struct RecompLauncherCModProvider;
 
@@ -68,6 +70,23 @@ int snes_mod_register_activation_plugin(const char* id,
  * disabled feature reliably restores the stock behavior on every launch.
  */
 int snes_mod_register_reset_callback(SNESModActivationCallback callback);
+
+/*
+ * Register callbacks from an active trusted plugin. APU write callbacks may
+ * return nonzero to consume the write before it reaches the stock SPC ports.
+ */
+int snes_mod_register_frame_callback(SNESModFrameCallback callback);
+int snes_mod_register_apu_write_callback(SNESModApuWriteCallback callback);
+void snes_mod_runtime_frame_tick_c(void);
+int snes_mod_runtime_filter_apu_write_c(uint16_t reg, uint8_t value);
+
+/*
+ * Request battery-backed SRAM for a stock cart that declares none. This is
+ * for enhancement mods that add guest-visible saves to password-only games.
+ * Existing cartridge SRAM is never resized by a mod.
+ */
+int snes_mod_request_synthetic_sram_c(uint32_t bytes);
+uint32_t snes_mod_runtime_synthetic_sram_size_c(void);
 
 #if defined(_MSC_VER)
 #pragma section(".CRT$XCU", read)

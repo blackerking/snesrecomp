@@ -271,6 +271,8 @@ static struct {
     InterpPreOpcodeHook hook;
 } s_pre_opcode_hooks[kInterpPreOpcodeHookSlots];
 static int s_pre_opcode_hook_count;
+static int s_pre_opcode_redirect_valid;
+static uint32_t s_pre_opcode_redirect_pc24;
 
 void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
                                        InterpPreOpcodeHook hook) {
@@ -299,6 +301,11 @@ void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
                     kInterpPreOpcodeHookSlots, (unsigned)pc24);
         }
     }
+}
+
+void interp_bridge_pre_opcode_redirect(uint32_t pc24) {
+    s_pre_opcode_redirect_pc24 = pc24 & 0xFFFFFFu;
+    s_pre_opcode_redirect_valid = 1;
 }
 
 /* BRK bridge seam. The bounce is via explicit JSR/JSL interception below, not
@@ -673,15 +680,17 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     {
         extern int snes_frame_counter;
         static int _iw_init = 0;
-        static long _iw_lo = -1, _iw_hi = -1, _iw_frame = -1;
+        static int _iw_has_range = 0;
+        static unsigned long _iw_lo = 0, _iw_hi = 0;
+        static long _iw_frame = -1;
         if (!_iw_init) { _iw_init = 1;
             const char *_e = getenv("SNESRECOMP_IBRWATCH");
             const char *_f = getenv("SNESRECOMP_IBRWATCH_FRAME");
-            if (_e) sscanf(_e, "%lx-%lx", &_iw_lo, &_iw_hi);
+            if (_e) _iw_has_range = sscanf(_e, "%lx-%lx", &_iw_lo, &_iw_hi) == 2;
             if (_f && *_f) _iw_frame = strtol(_f, NULL, 0);
         }
-        if (_iw_lo >= 0 && (long)entry_pc24 >= _iw_lo &&
-            (long)entry_pc24 <= _iw_hi &&
+        if (_iw_has_range && (unsigned long)entry_pc24 >= _iw_lo &&
+            (unsigned long)entry_pc24 <= _iw_hi &&
             (_iw_frame < 0 || snes_frame_counter == _iw_frame)) {
             _ibrw = 1;
             fprintf(stderr,
@@ -801,8 +810,15 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             for (int hi = 0; hi < s_pre_opcode_hook_count; hi++) {
                 if (s_pre_opcode_hooks[hi].pc24 == key) {
                     sync_interp_to_cpu(&in, cpu);
+                    s_pre_opcode_redirect_valid = 0;
                     s_pre_opcode_hooks[hi].hook(cpu, pc_before);
                     sync_cpu_to_interp(cpu, &in);
+                    if (s_pre_opcode_redirect_valid) {
+                        in.k = (uint8_t)((s_pre_opcode_redirect_pc24 >> 16) & 0xFF);
+                        in.pc = (uint16_t)(s_pre_opcode_redirect_pc24 & 0xFFFF);
+                        s_pre_opcode_redirect_valid = 0;
+                        continue;
+                    }
                     break;
                 }
             }
@@ -2011,12 +2027,14 @@ RecompReturn interp_tier_dispatch_rewritten_return(CpuState *cpu,
  * ALREADY pushed the 2-byte JSR return frame, so:
  *   - watermark = current S (post-push): the target's own RTS pops that
  *     frame and lifts S strictly above the watermark, exiting the bridge.
- *   - post_call = S + 2: the balanced S after the frame is consumed.
- * On a clean return the target's RTS already left S == post_call; on a bail
- * (step cap) we restore post_call ourselves so the frame is discarded and
- * the caller still falls through balanced. Either way return NORMAL — this
- * is a CALL, not a tail dispatch, so it never abandons the caller. Recorded
- * in the tier-2 gap manifest (kind=dispatch) for the worklist. */
+ *   - post_call = S + frame_size: balanced S after the frame is consumed.
+ * On a normal clean return the target's RTS already left S == post_call. A
+ * clean return past post_call is a guest non-local return (for example, a
+ * 16-bit PLA followed by RTL consumes this JSR frame and an outer JSL frame);
+ * translate that post-return S into the existing SKIP_N host-unwind contract.
+ * On a bail (step cap) restore post_call ourselves so the unconsumed frame is
+ * discarded and the caller still falls through balanced. Recorded in the
+ * tier-2 gap manifest (kind=dispatch) for the worklist. */
 RecompReturn interp_tier_run_call_frame(CpuState *cpu, uint32_t target_pc24,
                                         uint32_t source_pc24,
                                         uint8_t frame_size,
@@ -2037,8 +2055,15 @@ RecompReturn interp_tier_run_call_frame(CpuState *cpu, uint32_t target_pc24,
     RecompReturn propagated;
     if (interp_run_propagated_return(ok, &propagated))
         return propagated;
-    if (!ok)
+    if (!ok) {
         cpu->S = post_call;  /* bail: discard the unconsumed JSR frame */
+        return RECOMP_RETURN_NORMAL;
+    }
+    if (cpu->S != post_call) {
+        int skip = cpu_resolve_post_return_skip(cpu->S);
+        if (skip < 1) skip = 1;
+        return (RecompReturn)skip;
+    }
     return RECOMP_RETURN_NORMAL;
 }
 
@@ -2090,6 +2115,17 @@ static const char *tier2_kind_str(uint8_t k) {
         case TIER2_KIND_GOTO_GAP:      return "goto_gap";
         default:                       return "indirect_dispatch";
     }
+}
+
+static int tier2_verbose(void) {
+    static int checked;
+    static int verbose;
+    if (!checked) {
+        const char *value = getenv("SNESRECOMP_TIER2_VERBOSE");
+        verbose = value && *value && *value != '0';
+        checked = 1;
+    }
+    return verbose;
 }
 
 /* Shared discovery-array body, used by both serializers. */
@@ -2188,7 +2224,10 @@ void Tier2CoverageWriteManifest(const char *path, const char *rom_title) {
 }
 
 void Tier2CoverageWriteDefaultManifest(const char *rom_title) {
+    if (!tier2_capture_enabled())
+        return;
     const char *path = tier2_capture_manifest_path(rom_title);
     Tier2CoverageWriteManifest(path, rom_title);
-    fprintf(stderr, "[tier2] per-run coverage manifest: %s\n", path);
+    if (tier2_verbose())
+        fprintf(stderr, "[tier2] per-run coverage manifest: %s\n", path);
 }

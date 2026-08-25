@@ -1050,7 +1050,8 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
         # callee consumes the frame as table data and never resumes lexical
         # fall-through, so it is terminal regardless of whether the callee has
         # a conventional exit-mode fact.
-        if getattr(insn, 'terminal_jsr', False):
+        if (getattr(insn, 'terminal_jsr', False)
+                or getattr(insn, 'noreturn_jsr', False)):
             return []
         ret_m, ret_x = post_m, post_x
         target_pc24: Optional[int] = None
@@ -1216,12 +1217,26 @@ def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
         0x48, 0xDA, 0x5A, 0x08, 0x8B, 0x4B, 0x0B,     # PHA/PHX/PHY/PHP/PHB/PHK/PHD
         0xEA, 0x42,                                   # NOP / WDM
     }
+    Y_MUTATING = {
+        0xA0, 0xA4, 0xB4, 0xAC, 0xBC, 0xC8, 0x88, 0x7A, 0xA8, 0x9B,
+    }
+    X_MUTATING = {
+        0xA2, 0xA6, 0xB6, 0xAE, 0xBE, 0xE8, 0xCA, 0xFA, 0xAA, 0xBA, 0xBB,
+    }
+    CONTROL_TRANSFER = {
+        0x00, 0x02, 0x10, 0x20, 0x22, 0x30, 0x40, 0x4C, 0x50, 0x5C, 0x60, 0x6B,
+        0x70, 0x80, 0x82, 0x90, 0xB0, 0xD0, 0xDC, 0xF0, 0x6C, 0x7C,
+    }
     pc = addr & 0xFFFF
     m, x = entry_m & 1, entry_x & 1
     a_slot = None     # stack slot the live A value came from (LDA $nn,S)
+    a_pulled = False  # live A value came from PLA of the return address
     a_added = 0       # constant added to that value since the load
     y_slot = None     # stack slot copied through Y via TAY/TYA
+    y_pulled = False
     y_added = 0
+    x_pulled = False
+    x_added = 0
     budget = 0
     while budget < 96:
         budget += 1
@@ -1242,41 +1257,92 @@ def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
             return None
         if mn == 'REP':
             if ins.operand & 0x20: m = 0
-            if ins.operand & 0x10: x = 0
+            if ins.operand & 0x10:
+                x = 0
+                x_pulled = False
+                x_added = 0
         elif mn == 'SEP':
             if ins.operand & 0x20: m = 1
-            if ins.operand & 0x10: x = 1
+            if ins.operand & 0x10:
+                x = 1
+                x_pulled = False
+                x_added = 0
         elif mn == 'LDA' and ins.mode == STK:
             a_slot = ins.operand & 0xFF       # (re)start tracking from this slot
+            a_pulled = False
+            a_added = 0
+        elif op == 0x68:                       # PLA
+            a_slot = None
+            a_pulled = True
             a_added = 0
         elif op == 0xA8:                       # TAY
-            if a_slot is not None:
+            if a_slot is not None or a_pulled:
                 y_slot = a_slot
+                y_pulled = a_pulled
                 y_added = a_added
             else:
                 y_slot = None
+                y_pulled = False
                 y_added = 0
         elif op == 0x98:                       # TYA
-            if y_slot is not None:
+            if y_slot is not None or y_pulled:
                 a_slot = y_slot
+                a_pulled = y_pulled
                 a_added = y_added
             else:
                 a_slot = None
+                a_pulled = False
                 a_added = 0
-        elif op == 0x69 and a_slot is not None:   # ADC #imm (m-dependent)
+        elif op == 0x69 and (a_slot is not None or a_pulled):   # ADC #imm
             a_added = (a_added + ins.operand) & 0xFFFF
         elif op == 0x83 and ins.mode == STK:      # STA $nn,S — return-addr write-back
             if a_slot is not None and (ins.operand & 0xFF) == a_slot and a_added:
                 return a_added & 0xFF             # inline byte count
             # store-back without an add (or to a different slot): not it
+        elif op == 0x48 and a_pulled:             # PHA
+            if a_added:
+                return a_added & 0xFF
+            a_pulled = False
+            a_added = 0
+        elif op == 0xFA:                          # PLX
+            x_pulled = True
+            x_added = 0
+        elif op == 0xE8 and x_pulled:             # INX
+            x_added = (x_added + 1) & 0xFFFF
+        elif op == 0xDA and x_pulled:             # PHX
+            if x_added:
+                return x_added & 0xFF
+            x_pulled = False
+            x_added = 0
+        elif op in CONTROL_TRANSFER:
+            a_slot = None
+            a_pulled = False
+            a_added = 0
+            y_slot = None
+            y_pulled = False
+            y_added = 0
+            x_pulled = False
+            x_added = 0
         elif op in A_PRESERVING:
-            if op in (0xA0, 0xA4, 0xB4, 0xAC, 0xBC, 0xC8, 0x88, 0x7A):
+            if op in Y_MUTATING:
                 y_slot = None
+                y_pulled = False
                 y_added = 0
+            if op in X_MUTATING:
+                x_pulled = False
+                x_added = 0
             pass                                  # A unchanged; keep tracking
         else:
             a_slot = None                         # A clobbered — reset
+            a_pulled = False
             a_added = 0
+            if op in Y_MUTATING:
+                y_slot = None
+                y_pulled = False
+                y_added = 0
+            if op in X_MUTATING:
+                x_pulled = False
+                x_added = 0
         pc = (pc + ins.length) & 0xFFFF
     return None
 
@@ -1506,6 +1572,7 @@ def decode_function(rom: bytes, bank: int, start: int,
                     sibling_entry_pcs: Optional[set] = None,
                      inline_arg_map: Optional[Dict[int, int]] = None,
                      terminal_jsr_sites: Optional[set] = None,
+                     noreturn_jsr_sites: Optional[set] = None,
                      stop_on_unknown_callee_exit: bool = False,
                     ) -> "FunctionDecodeGraph":
     """Public cached wrapper around `_decode_function_uncached`.
@@ -1530,6 +1597,7 @@ def decode_function(rom: bytes, bank: int, start: int,
             sibling_entry_pcs=sibling_entry_pcs,
             inline_arg_map=inline_arg_map,
             terminal_jsr_sites=terminal_jsr_sites,
+            noreturn_jsr_sites=noreturn_jsr_sites,
             stop_on_unknown_callee_exit=stop_on_unknown_callee_exit,
         )
 
@@ -1545,6 +1613,7 @@ def decode_function(rom: bytes, bank: int, start: int,
         _identity(sibling_entry_pcs),
         _identity(inline_arg_map),
         _identity(terminal_jsr_sites),
+        _identity(noreturn_jsr_sites),
         bool(stop_on_unknown_callee_exit),
     )
     cached = _DECODE_CACHE.get(cache_key)
@@ -1568,6 +1637,7 @@ def decode_function(rom: bytes, bank: int, start: int,
         sibling_entry_pcs=sibling_entry_pcs,
         inline_arg_map=inline_arg_map,
         terminal_jsr_sites=terminal_jsr_sites,
+        noreturn_jsr_sites=noreturn_jsr_sites,
         stop_on_unknown_callee_exit=stop_on_unknown_callee_exit,
     )
     _DECODE_CACHE[cache_key] = graph
@@ -1588,6 +1658,7 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     sibling_entry_pcs: Optional[set] = None,
                      inline_arg_map: Optional[Dict[int, int]] = None,
                      terminal_jsr_sites: Optional[set] = None,
+                     noreturn_jsr_sites: Optional[set] = None,
                      stop_on_unknown_callee_exit: bool = False,
                     ) -> FunctionDecodeGraph:
     """Decode a function starting at (bank, start) with entry (m, x) state.
@@ -1743,6 +1814,18 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     f"terminal_jsr at ${insn.addr & 0xFFFFFF:06X} does not "
                     f"name a direct three-byte JSR (decoded {insn.mnem})")
             insn.terminal_jsr = True
+        if (noreturn_jsr_sites
+                and (insn.addr & 0xFFFFFF) in noreturn_jsr_sites):
+            if not (insn.mnem == 'JSR' and insn.mode != INDIR_X
+                    and insn.length == 3):
+                raise ValueError(
+                    f"noreturn_jsr at ${insn.addr & 0xFFFFFF:06X} does not "
+                    f"name a direct three-byte JSR (decoded {insn.mnem})")
+            if insn.terminal_jsr:
+                raise ValueError(
+                    f"JSR at ${insn.addr & 0xFFFFFF:06X} cannot be both "
+                    "terminal_jsr and noreturn_jsr")
+            insn.noreturn_jsr = True
 
         # JSL/JML dispatch-table detection: if the call target is a
         # registered dispatch helper, decode the bytes immediately
