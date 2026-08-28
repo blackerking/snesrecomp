@@ -759,9 +759,26 @@ void interp_bridge_dump_recent_steps(int n, FILE *out) {
 }
 
 /* Install the ring dump as cpu_state.c's halt-path hook (explicit hook, not
- * a PE weak symbol — see cpu_state.c). Constructor runs at image load. */
+ * a PE weak symbol — see cpu_state.c). Runs at image load.
+ *
+ * __attribute__((constructor)) is a GCC/Clang extension; MSVC rejects it
+ * outright ("syntax error: missing ')' before '('"), which broke every target
+ * that compiles this file. MSVC's equivalent is a function pointer placed in
+ * the .CRT$XCU section, which the CRT walks before main(). */
+static void itrace_install_dump_hook(void);
+#if defined(_MSC_VER)
+#  pragma section(".CRT$XCU", read)
+__declspec(allocate(".CRT$XCU"))
+/* External linkage: /include: below needs a symbol the linker can see,
+ * and it stops the section pointer being discarded. */
+void (*itrace_install_dump_hook_ctor)(void) = itrace_install_dump_hook;
+#  pragma comment(linker, "/include:itrace_install_dump_hook_ctor")
+static void itrace_install_dump_hook(void)
+#else
 __attribute__((constructor))
-static void itrace_install_dump_hook(void) {
+static void itrace_install_dump_hook(void)
+#endif
+{
     g_interp_recent_dump_hook = interp_bridge_dump_recent_steps;
 }
 
