@@ -52,6 +52,10 @@ typedef void (*InterpPreOpcodeHook)(CpuState *cpu, uint32_t pc24);
 void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
                                        InterpPreOpcodeHook hook);
 void interp_bridge_pre_opcode_redirect(uint32_t pc24);
+/* Dump the last n entries of the always-on global interp step ring
+ * (pc/op/sp/frame per interpreted opcode) to `out` (NULL = stderr). */
+#include <stdio.h>
+void interp_bridge_dump_recent_steps(int n, FILE *out);
 
 /*
  * Run the interpreter over guest code at entry_pc24, in the context of `cpu`.
@@ -102,7 +106,10 @@ void interp_bridge_set_master_deadline(uint64_t master_clock);
 int interp_bridge_lle_master_deadline_reached(const CpuState *cpu);
 
 /* Execute an architectural interrupt handler through its terminal RTI. The
- * caller has already materialized the hardware interrupt frame. */
+ * caller has already materialized the hardware interrupt frame, usually with
+ * cpu_push_interrupt_frame_at(). Do not enter an interrupt body directly from a
+ * host scheduler unless that frame is on the guest stack for the terminal RTI
+ * to consume. */
 int interp_bridge_run_interrupt(CpuState *cpu, uint32_t entry_pc24);
 
 /* Save-state task resume: interpret a suspended cooperative task from its

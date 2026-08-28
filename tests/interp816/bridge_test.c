@@ -13,6 +13,8 @@
  *   S2: pure interp routine (no call) -> exits balanced, no bounce.
  *   S3: interp routine that JSRs a NON-compiled target -> interpreted through,
  *       its RTS returns to caller level (no premature exit), final RTS exits.
+ *   S13: runtime-call fallback executing M=0 PLA; RTL consumes its inner JSR
+ *        and an outer JSL, propagating SKIP_1 to the compiled caller.
  *
  * Build/run: tests/interp816/run.sh (WSL gcc). Validation only.
  */
@@ -35,6 +37,7 @@ static int      g_aot_interp_nlr;
 static int      g_aot_double_rewrite;
 static int      g_aot_crosses_interp_owner;
 static int      g_aot_skips_interp_owner;
+static int      g_aot_deadline_unwind;
 static int      g_owner_target_result;
 static int      g_aot_tail_chain_probe;
 static int      g_aot_skips_root;
@@ -69,6 +72,9 @@ void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
 void cart_sync_coprocessors(Cart *cart, uint64_t master_clock) {
     (void)cart; (void)master_clock;
 }
+/* cpu_state.c isn't linked here; the bridge's constructor installs its
+ * step-ring dump into this hook, so provide the slot. */
+void (*g_interp_recent_dump_hook)(int n, FILE *out) = 0;
 uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
     (void)cpu; return RAM[(((uint32)bank << 16) | addr) & 0xFFFFFF];
 }
@@ -145,6 +151,15 @@ RecompReturn cpu_dispatch_pc_paired(CpuState *cpu, uint32 pc24,
         g_recomp_stack_top = base;
         if (g_owner_target_result)
             return interp_bridge_lle_yield_unwind(cpu, 0x008003);
+        return RECOMP_RETURN_NORMAL;
+    }
+    if (g_aot_deadline_unwind && (pc24 & 0xFFFFFF) == FAKE_AOT) {
+        g_aot_called++;
+        cpu->master_cycles = 200;
+        if (interp_bridge_lle_master_deadline_reached(cpu))
+            return interp_bridge_lle_yield_unwind(cpu, 0x008100);
+        cpu->A = 0x0100;
+        cpu->S = (uint16)(cpu->S + frame_size);
         return RECOMP_RETURN_NORMAL;
     }
     if (g_aot_skips_root && (pc24 & 0xFFFFFF) == FAKE_AOT) {
@@ -287,6 +302,7 @@ int main(void) {
 #else
     setenv("SNESRECOMP_TIER2_JOURNAL", journal, 1);
 #endif
+    tier2_capture_set_default_enabled(1);
     RAM = malloc(MEMSZ);
 
     printf("S0 APU timeline policy remains cartridge-scoped\n");
@@ -558,6 +574,35 @@ int main(void) {
       CHECK(g_c.S == 0x01FF, "S=%04X exp 01FF (JSL frame consumed once)", g_c.S);
       g_aot_skips_root = 0; }
 
+    /* S8c: a compiled callee that reaches the host's master deadline while
+     * bounced from scheduler mode must return to the host. It must not be
+     * treated like a cooperative yield primitive, because that would continue
+     * interpreting past the host's expired bound. */
+    { memset(RAM, 0, MEMSZ); init_cpu(); g_aot_called = 0;
+      g_aot_deadline_unwind = 1;
+      interp_bridge_set_master_deadline(100);
+      uint8_t scheduler[] = {
+          0x22,0x00,0x81,0x00,                 /* JSL fake compiled root */
+          0xA9,0x5A,                           /* must not execute */
+          0xAD,0x20,0x00, 0xD0,0xFB            /* cooperative wait loop */
+      };
+      load(0x8000, scheduler, sizeof scheduler);
+      RAM[0x20] = 0;
+      int rc = interp_bridge_run_loop(&g_c, 0x008000, 0x008006, 0x0020, 0);
+      printf("S8c scheduler deadline unwind returns to host\n");
+      CHECK(rc == 1, "rc=%d exp 1", rc);
+      CHECK(g_aot_called == 1, "aot_called=%d exp 1", g_aot_called);
+      CHECK((g_c.A & 0xFF) == 0x00,
+            "A.lo=%02X exp 00 (scheduler continuation not executed)",
+            g_c.A & 0xFF);
+      CHECK(g_c.S == 0x01FC,
+            "S=%04X exp 01FC (compiled JSL frame retained)", g_c.S);
+      CHECK(interp_bridge_lle_resume_pc() == 0x008100,
+            "resume=$%06X exp $008100 (compiled deadline resume)",
+            (unsigned)interp_bridge_lle_resume_pc());
+      interp_bridge_set_master_deadline(0);
+      g_aot_deadline_unwind = 0; }
+
     /* S9: the same rewrite below the paired AOT root belongs to a compiled
      * ancestor, not directly to the scheduler interpreter.  Finish that
      * ancestor's epilogue in the nested tier, propagate SKIP_1 through its
@@ -671,6 +716,25 @@ int main(void) {
       interp_tier2_stats(&after, NULL, NULL);
       printf("S12 growable, kind-exact coverage set\n");
       CHECK(after == before + 4354, "sites=%d exp %d", after, before + 4354); }
+
+    /* S13: a runtime-pointer JSR falls back to the interpreter at a state
+     * handler whose 16-bit PLA consumes that inner JSR frame, then RTL
+     * consumes the compiled caller's outer JSL frame. This is a clean guest
+     * non-local return, not a balanced call return, so propagate at least
+     * SKIP_1 even when the synthetic resolver has no matching ancestor. */
+    { memset(RAM, 0, MEMSZ); init_cpu(); g_post_return_skip = 0;
+      g_c.emulation = 0; g_c.m_flag = 0; g_c.x_flag = 0;
+      cpu_mirrors_to_p(&g_c);
+      uint8_t c[] = {0x68,0x6B};              /* PLA (16-bit) ; RTL */
+      load(0x8400, c, sizeof c);
+      cpu_push_jsl_return_frame(&g_c);        /* compiled caller's outer frame */
+      cpu_push_jsr_return_frame(&g_c);        /* runtime dispatch's call frame */
+      RecompReturn r = interp_tier_run_call_frame(
+          &g_c, 0x008400, 0x0083FC, 2, NULL);
+      printf("S13 runtime call propagates interpreted PLA; RTL NLR\n");
+      CHECK(r == RECOMP_RETURN_SKIP_1, "r=%d exp SKIP_1", (int)r);
+      CHECK(g_c.S == 0x01FF,
+            "S=%04X exp 01FF (inner JSR and outer JSL consumed)", g_c.S); }
 
     printf("\n==== interp_bridge Phase-1: %d/%d checks passed ====\n", g_check - g_fail, g_check);
     if (g_fail) { printf("RESULT: FAIL (%d)\n", g_fail); return 1; }
