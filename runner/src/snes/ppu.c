@@ -2096,7 +2096,27 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
             int px_right = IntMin(256 + kPpuExtraLeftRight - (col + x), 8);
             PpuZbufType *dst = ppu->objBuffer.data + col + x + px_left + kPpuExtraLeftRight;
             int slot = index >> 1;
-            PpuOverlayCapture *obj_capture =
+             /* Clip an unhinted sprite at the SCREEN EDGE, per pixel.
+             *
+             * PpuWidescreenOamLeftHintAllows() gates whole sprites, so a
+             * sprite is drawn entirely or not at all. For an object sliding
+             * off the left that means it pops out in whole-sprite steps --
+             * the title's SimCity sign is three 16 px sprites, so it leaves
+             * in three 16 px chunks instead of sliding.
+             *
+             * Hardware clips at x=0 per pixel. Doing the same here makes the
+             * object leave smoothly and costs nothing elsewhere: a sprite
+             * fully on screen never has a negative pixel, and a host-placed
+             * one is hinted and keeps its margin pixels. */
+            static int ws_edge_clip_on = -1;
+            if (ws_edge_clip_on < 0) {
+              const char *e = getenv("SC_WS_OBJ_EDGE_CLIP");
+              ws_edge_clip_on = (e && *e) ? (*e != '0') : 1;
+            }
+            const bool ws_clip_left =
+                ws_edge_clip_on && ppu->wsOamLeftHintStrict &&
+                !(ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7)));
+           PpuOverlayCapture *obj_capture =
                 &ppu->overlayCaptures[kPpuOverlaySource_Obj];
             bool capture_slot = PpuOverlayActiveOnLine(
           ppu, kPpuOverlaySource_Obj, line) && obj_capture->oamCount &&
@@ -2111,6 +2131,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
         int pixel = (bits >> 0) & 1 | (bits >> 7) & 2 |
                     (bits >> 14) & 4 | (bits >> 21) & 8;
         if (pixel == 0) continue;
+        if (ws_clip_left && col + x + px < 0) continue;
               if (capture_slot) {
                 int screen_x = col + x + px;
                 if (screen_x >= obj_capture->x0 && screen_x < obj_capture->x1) {
