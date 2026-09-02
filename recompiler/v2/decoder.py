@@ -1172,8 +1172,8 @@ def _pea_ptrcall_return_pc(rom: Optional[bytes], bank: int, pc: int,
     return (pea_operand + 1) & 0xFFFF
 
 
-def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
-                            entry_m: int = 1, entry_x: int = 1):
+def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
+                                        entry_m: int = 1, entry_x: int = 1):
     """Detect whether the subroutine at (bank, addr) is a JSR/JSL
     INLINE-ARGUMENT routine, returning the inline byte count N (or None).
 
@@ -1182,7 +1182,7 @@ def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
     ADVANCES the stacked return address by a constant N so its RTS/RTL
     returns PAST the inline data. The game-agnostic 65816 signature:
 
-        LDA $rr,S        ; load the return-address-low slot (rr=1 here)
+        LDA $rr,S        ; load the current return-address-low slot
         ... (A preserved: STA dp/abs, CLC/SEC) ...
         ADC #N           ; advance the return address by N
         STA $rr,S        ; write it back to the SAME slot
@@ -1229,13 +1229,49 @@ def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
     }
     pc = addr & 0xFFFF
     m, x = entry_m & 1, entry_x & 1
-    a_slot = None     # stack slot the live A value came from (LDA $nn,S)
-    a_pulled = False  # live A value came from PLA of the return address
-    a_added = 0       # constant added to that value since the load
-    y_slot = None     # stack slot copied through Y via TAY/TYA
+    stack_depth = 0
+    return_valid = 0b11
+    status_slots = {}
+
+    def return_mask(start, size):
+        mask = 0
+        if start <= 1 < start + size:
+            mask |= 0b01
+        if start <= 2 < start + size:
+            mask |= 0b10
+        return mask
+
+    def return_bytes_valid(start, size):
+        if start != 1 or size not in (1, 2):
+            return False
+        mask = (1 << size) - 1
+        return return_valid & mask == mask
+
+    def invalidate_stack_write(start, size):
+        nonlocal return_valid
+        return_valid &= ~return_mask(start, size)
+        for pos in range(start, start + size):
+            status_slots.pop(pos, None)
+
+    def push_bytes(size):
+        nonlocal stack_depth
+        stack_depth -= size
+        start = stack_depth + 1
+        invalidate_stack_write(start, size)
+        return start
+
+    a_slot = None
+    a_slot_size = 0
+    a_pulled = False
+    a_pulled_size = 0
+    a_added = 0
+    y_slot = None
+    y_slot_size = 0
     y_pulled = False
+    y_pulled_size = 0
     y_added = 0
     x_pulled = False
+    x_pulled_size = 0
     x_added = 0
     budget = 0
     while budget < 96:
@@ -1256,95 +1292,390 @@ def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
         if mn in _TERMINATORS:
             return None
         if mn == 'REP':
-            if ins.operand & 0x20: m = 0
+            if ins.operand & 0x20:
+                changed = m != 0
+                m = 0
+                if changed:
+                    a_slot = None
+                    a_slot_size = 0
+                    a_pulled = False
+                    a_pulled_size = 0
+                    a_added = 0
             if ins.operand & 0x10:
+                changed = x != 0
                 x = 0
-                x_pulled = False
-                x_added = 0
+                if changed:
+                    y_slot = None
+                    y_slot_size = 0
+                    y_pulled = False
+                    y_pulled_size = 0
+                    y_added = 0
+                    x_pulled = False
+                    x_pulled_size = 0
+                    x_added = 0
         elif mn == 'SEP':
-            if ins.operand & 0x20: m = 1
+            if ins.operand & 0x20:
+                changed = m != 1
+                m = 1
+                if changed:
+                    a_slot = None
+                    a_slot_size = 0
+                    a_pulled = False
+                    a_pulled_size = 0
+                    a_added = 0
             if ins.operand & 0x10:
+                changed = x != 1
                 x = 1
-                x_pulled = False
-                x_added = 0
+                if changed:
+                    y_slot = None
+                    y_slot_size = 0
+                    y_pulled = False
+                    y_pulled_size = 0
+                    y_added = 0
+                    x_pulled = False
+                    x_pulled_size = 0
+                    x_added = 0
         elif mn == 'LDA' and ins.mode == STK:
-            a_slot = ins.operand & 0xFF       # (re)start tracking from this slot
+            slot = ins.operand & 0xFF
+            size = 1 if m else 2
+            tracked = return_bytes_valid(stack_depth + slot, size)
+            a_slot = slot if tracked else None
+            a_slot_size = size if tracked else 0
             a_pulled = False
+            a_pulled_size = 0
             a_added = 0
         elif op == 0x68:                       # PLA
+            size = 1 if m else 2
             a_slot = None
-            a_pulled = True
+            a_slot_size = 0
+            a_pulled = return_bytes_valid(stack_depth + 1, size)
+            a_pulled_size = size if a_pulled else 0
             a_added = 0
+            stack_depth += size
         elif op == 0xA8:                       # TAY
-            if a_slot is not None or a_pulled:
+            if m == x and (a_slot is not None or a_pulled):
                 y_slot = a_slot
+                y_slot_size = a_slot_size
                 y_pulled = a_pulled
+                y_pulled_size = a_pulled_size
                 y_added = a_added
             else:
                 y_slot = None
+                y_slot_size = 0
                 y_pulled = False
+                y_pulled_size = 0
                 y_added = 0
         elif op == 0x98:                       # TYA
-            if y_slot is not None or y_pulled:
+            if m == x and (y_slot is not None or y_pulled):
                 a_slot = y_slot
+                a_slot_size = y_slot_size
                 a_pulled = y_pulled
+                a_pulled_size = y_pulled_size
                 a_added = y_added
             else:
                 a_slot = None
+                a_slot_size = 0
                 a_pulled = False
+                a_pulled_size = 0
                 a_added = 0
         elif op == 0x69 and (a_slot is not None or a_pulled):   # ADC #imm
             a_added = (a_added + ins.operand) & 0xFFFF
         elif op == 0x83 and ins.mode == STK:      # STA $nn,S — return-addr write-back
-            if a_slot is not None and (ins.operand & 0xFF) == a_slot and a_added:
+            slot = ins.operand & 0xFF
+            size = 1 if m else 2
+            start = stack_depth + slot
+            writeback = (a_slot is not None and slot == a_slot and
+                         a_slot_size == size and start == 1)
+            mask = return_mask(start, size)
+            if writeback and a_added and return_valid | mask == 0b11:
                 return a_added & 0xFF             # inline byte count
-            # store-back without an add (or to a different slot): not it
-        elif op == 0x48 and a_pulled:             # PHA
-            if a_added:
-                return a_added & 0xFF
+            invalidate_stack_write(start, size)
+            if writeback and not a_added:
+                return_valid |= mask
+        elif op == 0x48:                          # PHA
+            size = 1 if m else 2
+            start = push_bytes(size)
+            if (a_pulled and a_pulled_size == size and
+                    start == 1):
+                if a_added:
+                    if return_valid | return_mask(start, size) == 0b11:
+                        return a_added & 0xFF
+                else:
+                    return_valid |= return_mask(start, size)
             a_pulled = False
+            a_pulled_size = 0
             a_added = 0
         elif op == 0xFA:                          # PLX
-            x_pulled = True
+            size = 1 if x else 2
+            x_pulled = return_bytes_valid(stack_depth + 1, size)
+            x_pulled_size = size if x_pulled else 0
             x_added = 0
+            stack_depth += size
         elif op == 0xE8 and x_pulled:             # INX
             x_added = (x_added + 1) & 0xFFFF
-        elif op == 0xDA and x_pulled:             # PHX
-            if x_added:
-                return x_added & 0xFF
+        elif op == 0xDA:                          # PHX
+            size = 1 if x else 2
+            start = push_bytes(size)
+            if (x_pulled and x_pulled_size == size and
+                    start == 1):
+                if x_added:
+                    if return_valid | return_mask(start, size) == 0b11:
+                        return x_added & 0xFF
+                else:
+                    return_valid |= return_mask(start, size)
             x_pulled = False
+            x_pulled_size = 0
             x_added = 0
-        elif op in CONTROL_TRANSFER:
+        elif op == 0x5A:                          # PHY
+            push_bytes(1 if x else 2)
+            y_pulled = False
+            y_pulled_size = 0
+            y_added = 0
+        elif op == 0x08:                          # PHP
+            status_slots[push_bytes(1)] = (m, x)
+        elif op in (0x8B, 0x4B):                 # PHB / PHK
+            push_bytes(1)
+        elif op == 0x0B:                          # PHD
+            push_bytes(2)
+        elif op in (0xF4, 0xD4, 0x62):           # PEA / PEI / PER
+            push_bytes(2)
             a_slot = None
+            a_slot_size = 0
             a_pulled = False
+            a_pulled_size = 0
+            a_added = 0
+        elif op == 0x7A:                          # PLY
+            stack_depth += 1 if x else 2
+            a_slot = None
+            a_slot_size = 0
+            a_pulled = False
+            a_pulled_size = 0
             a_added = 0
             y_slot = None
             y_pulled = False
+            y_pulled_size = 0
+            y_added = 0
+        elif op == 0xAB:                          # PLB
+            stack_depth += 1
+            a_slot = None
+            a_slot_size = 0
+            a_pulled = False
+            a_pulled_size = 0
+            a_added = 0
+        elif op == 0x2B:                          # PLD
+            stack_depth += 2
+            a_slot = None
+            a_slot_size = 0
+            a_pulled = False
+            a_pulled_size = 0
+            a_added = 0
+        elif op == 0x28:                          # PLP
+            saved = status_slots.pop(stack_depth + 1, None)
+            if saved is None:
+                return None
+            stack_depth += 1
+            m, x = saved
+            a_slot = None
+            a_slot_size = 0
+            a_pulled = False
+            a_pulled_size = 0
+            a_added = 0
+            y_slot = None
+            y_slot_size = 0
+            y_pulled = False
+            y_pulled_size = 0
             y_added = 0
             x_pulled = False
+            x_pulled_size = 0
+            x_added = 0
+        elif op in (0x9A, 0x1B, 0xFB):           # TXS / TCS / XCE
+            return None
+        elif op in CONTROL_TRANSFER:
+            a_slot = None
+            a_slot_size = 0
+            a_pulled = False
+            a_pulled_size = 0
+            a_added = 0
+            y_slot = None
+            y_slot_size = 0
+            y_pulled = False
+            y_pulled_size = 0
+            y_added = 0
+            x_pulled = False
+            x_pulled_size = 0
             x_added = 0
         elif op in A_PRESERVING:
             if op in Y_MUTATING:
                 y_slot = None
+                y_slot_size = 0
                 y_pulled = False
+                y_pulled_size = 0
                 y_added = 0
             if op in X_MUTATING:
                 x_pulled = False
+                x_pulled_size = 0
                 x_added = 0
             pass                                  # A unchanged; keep tracking
         else:
             a_slot = None                         # A clobbered — reset
+            a_slot_size = 0
             a_pulled = False
+            a_pulled_size = 0
             a_added = 0
             if op in Y_MUTATING:
                 y_slot = None
+                y_slot_size = 0
                 y_pulled = False
+                y_pulled_size = 0
                 y_added = 0
             if op in X_MUTATING:
                 x_pulled = False
+                x_pulled_size = 0
                 x_added = 0
         pc = (pc + ins.length) & 0xFFFF
     return None
+
+
+def _pulled_return_slots(insns) -> set:
+    """Addresses that received a byte pulled straight off the stack.
+
+    `PLA` immediately followed by `STA <dp/abs>` is how a routine copies its
+    own return address out of the stack frame. Two or more of those in a row,
+    into consecutive addresses, is a 16- or 24-bit return-address pointer.
+    Returns the base address of every such run.
+    """
+    got = []
+    pending = False
+    for ins in insns:
+        if ins.opcode == 0x68:            # PLA
+            pending = True
+            continue
+        if pending and ins.opcode in (0x85, 0x8D):   # STA dp / STA abs
+            got.append(ins.operand & 0xFFFF)
+        pending = False
+    bases = set()
+    run_start = None
+    for i, a in enumerate(got):
+        if run_start is None:
+            run_start = a
+        elif a != got[i - 1] + 1:
+            run_start = a
+        if run_start is not None and a - run_start >= 1:
+            bases.add(run_start)
+    return bases
+
+
+def _indirect_through_pulled_return(insns, last) -> bool:
+    """True when `last` is an indirect jump through a pulled return address."""
+    bases = _pulled_return_slots(insns)
+    if not bases:
+        return False
+    ptr = last.operand & 0xFFFF
+    return ptr in bases
+
+
+def detect_dp_return_inline_arg_bytes(rom: bytes, bank: int, addr: int):
+    """Inline-argument count for the PLA-into-direct-page return idiom.
+
+    `detect_inline_arg_bytes` above recognises the form that writes the
+    adjusted return address BACK TO THE STACK SLOT and leaves through RTS/RTL.
+    This is the other spelling: pull the 24-bit return address into consecutive
+    direct-page bytes, add the inline size to the low word, and leave through
+    `JML [dp]`. Gundam Wing Endless Duel's $00:8F2F is the canonical case and
+    has 37 call sites, so getting it wrong is not a local defect.
+
+        STA $E4              ; (the routine's own index argument)
+        SEP #$20
+        PLA / STA $E0        ; return address low
+        PLA / STA $E1        ;                high
+        PLA / STA $E2        ;                bank
+        ...
+        CLC / LDA $E0 / ADC #$0007 / STA $E0
+        JML [$00E0]          ; return, past 7 bytes of inline data
+
+    Returns N, or None when the shape does not match exactly.
+    """
+    from snes65816 import decode_insn, lorom_offset
+    pc = addr & 0xFFFF
+    m = x = 1
+    pulled = []          # dp addresses that received a PLA byte, in order
+    pending_pla = False
+    ret_base = None
+    armed = False        # LDA <ret_base> seen, tracking an ADC
+    added = 0
+    found_n = None
+    budget = 0
+    while budget < 160:
+        budget += 1
+        if not (0x8000 <= pc <= 0xFFFF):
+            return None
+        try:
+            off = lorom_offset(bank, pc)
+        except AssertionError:
+            return None
+        if off >= len(rom):
+            return None
+        try:
+            ins = decode_insn(rom, off, pc, bank, m=m, x=x)
+        except Exception:
+            return None
+        if ins is None:
+            return None
+        op = ins.opcode
+
+        if ins.mnem == 'REP':
+            if ins.operand & 0x20: m = 0
+            if ins.operand & 0x10: x = 0
+        elif ins.mnem == 'SEP':
+            if ins.operand & 0x20: m = 1
+            if ins.operand & 0x10: x = 1
+
+        if op == 0x68:                                  # PLA
+            pending_pla = True
+        elif pending_pla and op == 0x85:                # STA dp, right after PLA
+            pulled.append(ins.operand & 0xFF)
+            pending_pla = False
+            if len(pulled) >= 2 and pulled[-1] == pulled[-2] + 1:
+                ret_base = pulled[0]
+        else:
+            pending_pla = False
+            if ret_base is not None:
+                if op == 0xA5 and (ins.operand & 0xFF) == ret_base:   # LDA dp
+                    armed, added = True, 0
+                elif armed and op == 0x69:                            # ADC #imm
+                    added = (added + ins.operand) & 0xFFFF
+                elif armed and op == 0x85 and (ins.operand & 0xFF) == ret_base:
+                    if added:
+                        found_n = added                  # LDA/ADC/STA back to dp
+                    armed = False
+                elif op == 0xDC:                                      # JML [abs]
+                    ptr = ins.operand & 0xFFFF
+                    if (ptr & 0xFF) == ret_base and (ptr >> 8) == 0 and found_n:
+                        return found_n & 0xFF
+                    return None
+                elif ins.mnem in ('RTS', 'RTL', 'RTI', 'JMP', 'JML', 'STP'):
+                    return None
+        pc = (pc + ins.length) & 0xFFFF
+    return None
+
+
+def detect_inline_arg_bytes(rom: bytes, bank: int, addr: int,
+                            entry_m: int = 1, entry_x: int = 1):
+    """Inline-argument byte count for the routine at (bank, addr), or None.
+
+    Two spellings of the same idiom, tried in order:
+      * stack-slot write-back, leaving through RTS/RTL
+        (`_detect_inline_arg_bytes_stack_slot`)
+      * pull into direct page, leaving through `JML [dp]`
+        (`detect_dp_return_inline_arg_bytes`)
+
+    The second cannot be folded into the first: that scanner returns None the
+    moment it meets a terminator, and `JML [dp]` IS this form's terminator.
+    """
+    n = _detect_inline_arg_bytes_stack_slot(rom, bank, addr, entry_m, entry_x)
+    if n is not None:
+        return n
+    return detect_dp_return_inline_arg_bytes(rom, bank, addr)
 
 
 def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
@@ -1406,6 +1737,16 @@ def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
     last = insns[-1]
     if not (last.mnem in ('JMP', 'JML') and
             last.mode in (INDIR, INDIR_X, INDIR_L)):
+        return None
+    # ...but an indirect jump THROUGH THE PULLED RETURN ADDRESS is a return,
+    # not a dispatch. The inline-argument idiom pulls its own 24-bit return
+    # address into consecutive direct-page bytes, advances it past the inline
+    # data, and leaves through `JML [dp]`. That matches every structural test
+    # above — PLA present, terminal indirect jump, and an `ASL A ... TAX` that
+    # is really indexing a DATA table (Gundam Wing's $00:8F2F indexes a bitmask
+    # table for TSB, not a jump table). Classifying it as a dispatch synthesises
+    # a jump table out of unrelated data and abandons every call site.
+    if _indirect_through_pulled_return(insns, last):
         return None
     # Width: ASL A ... TAY/TAX, with ADC in between → long.
     asl_seen = False

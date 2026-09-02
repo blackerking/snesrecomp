@@ -31,13 +31,16 @@ enum {
   // Maximum widescreen expansion *per side*, baked into the priority-buffer
   // capacity. This is a compile-time ceiling only; the actual extra columns
   // rendered each frame are the runtime ppu->extraLeftCur/extraRightCur, which
-  // default to 0 (authentic 256-wide output). 96 per side allows up to a
-  // 448-pixel internal width, comfortably past 16:9 at 224 lines.
-  kPpuExtraLeftRight = 96,
+  // default to 0 (authentic 256-wide output). 272 per side allows up to an
+  // 800-pixel internal width, matching Star Fox Enhanced's 32:9 mode.
+  kPpuExtraLeftRight = 272,
   // Full internal width of the priority buffers (logical 256 + both borders).
   kPpuBufWidth = kPpuXPixels + kPpuExtraLeftRight * 2,
   // Split-screen games can assign distinct anchor layouts to each viewport.
   kPpuWsAnchorBands = 2,
+  // Number of stopped frames tolerated after a moving unhinted OBJ reaches the
+  // left widened margin.
+  kPpuWsOamMovingGraceFrames = 4,
 };
 
 typedef uint16_t PpuZbufType;
@@ -87,8 +90,8 @@ typedef struct PpuOverlayCapture {
   int16_t x0, x1;
   int16_t y0, y1;
   uint8_t flags;
-  /* OBJ-only selector. A zero count captures no objects. Games validate any
-   * semantic identity (HUD icon, portrait, etc.) before supplying the range. */
+  /* OBJ-only selector. Arming an OBJ capture selects all OAM slots by default;
+   * games can narrow this when they know the semantic slot range to export. */
   uint8_t oamFirst, oamCount;
 } PpuOverlayCapture;
 
@@ -182,7 +185,8 @@ struct Ppu {
   // pixel buffer (xbgr)
   // times 2 for even and odd frame
 
-  uint8_t extraLeftCur, extraRightCur, extraLeftRight, extraBottomCur;
+  uint16_t extraLeftCur, extraRightCur, extraLeftRight;
+  uint8_t extraBottomCur;
   // Widescreen BG3 HUD split (see PpuSetWidescreenHudSplit). 0 height = off.
   uint8_t wsHudSplitHeight, wsHudLeftEnd, wsHudRightStart;
   // Widescreen HUD OAM anchor (see PpuSetWsHudOamShiftRange): an OAM slot
@@ -250,6 +254,14 @@ struct Ppu {
   uint8_t wsOamLeftHint[16];
   uint8_t wsOamRightHintStrict;
   uint8_t wsOamRightHint[16];
+  /* Host-only temporal classifier for unhinted left-margin OBJ. It lets a
+   * game-authored sprite keep moving through the widened margin, then parks it
+   * again after its X stops changing for a few frames. */
+  int16_t wsOamMotionLastLine;
+  int16_t wsOamMotionX[128];
+  uint32_t wsOamMotionSig[128];
+  uint8_t wsOamMotionSeen[16];
+  uint8_t wsOamMotionGrace[128];
   uint8_t lastMosaicModulo;
   uint8_t lastBrightnessMult;
   bool lineHasSprites;
@@ -400,8 +412,20 @@ void ppu_handleVblank(Ppu* ppu);
 void ppu_runLine(Ppu* ppu, int line);
 uint8_t ppu_read(Ppu* ppu, uint8_t adr);
 void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val);
+
+/* Raster journal — per-line replay of mid-frame INIDISP writes for frame-model
+ * hosts. See the block comment in ppu.c. Host calls Begin after its
+ * vblank-edge work and ApplyLine in its render loop; the register write path
+ * calls Record with the beam line. */
+void ppu_rasterBegin(Ppu *ppu);
+void ppu_rasterRenderBegin(Ppu *ppu);
+int  ppu_rasterTakeHdmaen(uint8_t *out);
+void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val);
+void ppu_rasterApplyLine(Ppu *ppu, int line);
+int  ppu_rasterDebugDump(char *out, int cap);
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
+void PpuResetWidescreenOamHistory(Ppu *ppu);
 
 // Replace stale BG1 tilemap pixels in widened side margins before final
 // composition. The callback is host-only and runs independently for main and
@@ -443,12 +467,12 @@ bool PpuSetOverlayOamRange(Ppu *ppu, uint8_t first, uint8_t count);
 // kPpuExtraLeftRight). 0 restores authentic 256-wide rendering. The internal
 // render width becomes 256 + 2*extra. Drives the dormant extraLeftCur/
 // extraRightCur/extraLeftRight machinery used by the line renderer.
-void PpuSetExtraSpace(Ppu *ppu, uint8_t extra);
+void PpuSetExtraSpace(Ppu *ppu, uint16_t extra);
 
 // Render authentic 256-wide content centered within a `budget`-per-side wider
 // framebuffer (no border columns drawn). For bounded screens; caller blacks
 // out the side margins to pillarbox.
-void PpuSetExtraSpaceCentered(Ppu *ppu, uint8_t budget);
+void PpuSetExtraSpaceCentered(Ppu *ppu, uint16_t budget);
 
 // Asymmetric per-side widescreen margin (the snesrev/zelda3 model, see
 // attribution in IMPROVEMENTS.md). The centering budget (extraLeftRight) must
