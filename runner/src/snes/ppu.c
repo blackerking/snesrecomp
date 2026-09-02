@@ -2232,9 +2232,26 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
               const char *e = getenv("SC_WS_OBJ_EDGE_CLIP");
               ws_edge_clip_on = (e && *e) ? (*e != '0') : 1;
             }
+            /* NOT while the sprite is moving.
+             *
+             * PpuWidescreenOamLeftHintAllows() now lets an unhinted OBJ
+             * with motion grace travel into the widened left margin. This
+             * clip then threw away every one of its pixels past x=0, so
+             * the object was admitted and immediately erased -- reported
+             * from play as the title's SimCity sign fading out ON screen
+             * rather than leaving at the true edge. Measured on the title:
+             * with the clip off the sign tracks smoothly from x=56..94
+             * down to x=34..72 across the margin; with it on those pixels
+             * are simply gone.
+             *
+             * It still applies to a sprite that is NOT moving, which is
+             * what it was written for: an unhinted parked object has no
+             * business in the margin, and clipping it at the screen edge
+             * beats popping it out a whole sprite at a time. */
             const bool ws_clip_left =
                 ws_edge_clip_on && ppu->wsOamLeftHintStrict &&
-                !(ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7)));
+                !(ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7))) &&
+                ppu->wsOamMotionGrace[slot] == 0;
            PpuOverlayCapture *obj_capture =
                 &ppu->overlayCaptures[kPpuOverlaySource_Obj];
             bool capture_slot = PpuOverlayActiveOnLine(
