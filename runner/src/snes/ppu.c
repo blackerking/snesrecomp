@@ -2104,7 +2104,21 @@ static void PpuUpdateWidescreenOamHistory(Ppu *ppu, int line) {
     uint32_t sig = PpuOamMotionSignature(ppu, index);
     if (PpuWsOamHistorySeen(ppu, slot) &&
         sig == ppu->wsOamMotionSig[slot]) {
-      if (x != ppu->wsOamMotionX[slot]) {
+      /* A STEP, not a teleport.
+       *
+       * "X changed" is too weak a test for movement. SimCity's scenario
+       * selector blinks a selection bracket by flipping it between an
+       * on-screen position and one 256 px to the left, which hardware
+       * clips and a widened margin does not. Every toggle looks like
+       * motion, so the grace never expires and the bracket sits in the
+       * margin blinking -- measured as 128 stray green pixels there.
+       *
+       * Real movement is small and per-frame: the title sign this
+       * classifier exists for travels about 2 px a frame. A jump of a
+       * whole screen is a game hiding something, not an object moving,
+       * so it must not refresh the grace. */
+      const int dx = x - ppu->wsOamMotionX[slot];
+      if (dx != 0 && dx > -32 && dx < 32) {
         ppu->wsOamMotionGrace[slot] = kPpuWsOamMovingGraceFrames;
       } else if (ppu->wsOamMotionGrace[slot]) {
         ppu->wsOamMotionGrace[slot]--;
