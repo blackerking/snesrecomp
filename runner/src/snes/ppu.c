@@ -2092,12 +2092,39 @@ static void PpuWsOamHistoryMarkSeen(Ppu *ppu, uint8_t slot) {
   ppu->wsOamMotionSeen[slot >> 3] |= (uint8_t)(1u << (slot & 7));
 }
 
+/* Once per FRAME, and a repeated line is not a new frame.
+ *
+ * The guard used to skip only when the line number ADVANCED, so an equal
+ * line number read as a frame boundary. That holds for a host that renders
+ * each line once. A host that re-renders lines into scratch surfaces -- to
+ * isolate the backgrounds, or the OBJ layer, for a widescreen compositor --
+ * arrives a second time with line == lastLine, which the old test took for a
+ * wrap. The body then ran on the order of once per line.
+ *
+ * That is fatal to a classifier built on per-frame deltas. OAM does not
+ * change between two passes over the same line, so every repeat saw dx == 0:
+ * the first pass set the grace and the repeats decremented it straight back
+ * to zero. Measured on SimCity's city view, which re-renders every line for
+ * its margin passes: the longest unbroken stretch of frames on which ANY
+ * slot held motion grace was 1, against 68 once this is keyed correctly.
+ * A moving sprite needs grace on every frame to stay drawn in a margin, so
+ * at 1 no game-authored object could ever hold one -- reported from play as
+ * the train missing from the widescreen margins.
+ *
+ * A real frame boundary is the line number going BACKWARDS, which a repeated
+ * line never does. line == 0 is accepted too, for hosts that pass it, with
+ * lastLine != 0 so a repeat there cannot double-run either. Hosts that render
+ * the field as lines 1..224 and never pass line 0 still wrap 224 -> 1.
+ *
+ * Deliberately not keyed on snes_frame_counter: RtlRunFrame owns that, and a
+ * host driving the PPU directly never calls it, which freezes the classifier
+ * outright -- tried, and it left the grace at zero for the whole run. */
 static void PpuUpdateWidescreenOamHistory(Ppu *ppu, int line) {
-  if (ppu->wsOamMotionLastLine >= 0 && line > ppu->wsOamMotionLastLine) {
-    ppu->wsOamMotionLastLine = (int16_t)line;
-    return;
-  }
+  const int last = ppu->wsOamMotionLastLine;
+  const bool new_frame = last < 0 || line < last || (line == 0 && last != 0);
   ppu->wsOamMotionLastLine = (int16_t)line;
+  if (!new_frame)
+    return;
   for (uint8_t slot = 0; slot < 128; slot++) {
     uint8_t index = (uint8_t)(slot * 2);
     int16_t x = (int16_t)PpuDecodeOamX(ppu, index);
