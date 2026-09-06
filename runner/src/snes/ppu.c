@@ -30,7 +30,8 @@ static void PpuUpdateWidescreenOamHistory(Ppu *ppu, int line);
 Ppu* ppu_init(void) {
   Ppu* ppu = calloc(1, sizeof(Ppu));  /* zero padding: saveload/co-sim hash determinism */
   if (ppu)
-    ppu->wsOamMotionLastLine = -1;
+    ppu->wsOamMotionGraceOn = 1;
+  ppu->wsOamMotionLastLine = -1;
   return ppu;
 }
 
@@ -55,6 +56,7 @@ void ppu_reset(Ppu* ppu) {
     memcpy(ppu->overlayRenderBuffer, overlayBuffer, sizeof(overlayBuffer));
   }
   ppu->vramIncrement = 1;
+  ppu->wsOamMotionGraceOn = 1;
   ppu->wsOamMotionLastLine = -1;
 }
 
@@ -70,6 +72,7 @@ void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
 void PpuResetWidescreenOamHistory(Ppu *ppu) {
   if (!ppu)
     return;
+  ppu->wsOamMotionGraceOn = 1;
   ppu->wsOamMotionLastLine = -1;
   memset(ppu->wsOamMotionX, 0, sizeof(ppu->wsOamMotionX));
   memset(ppu->wsOamMotionSig, 0, sizeof(ppu->wsOamMotionSig));
@@ -2168,7 +2171,7 @@ static bool PpuWidescreenOamLeftHintAllows(Ppu *ppu, uint8_t index, int x,
   int slot = index >> 1;
   if (ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7)))
     return true;
-  return ppu->wsOamMotionGrace[slot] != 0;
+  return ppu->wsOamMotionGraceOn && ppu->wsOamMotionGrace[slot] != 0;
 }
 
 static bool ppu_evaluateSprites(Ppu* ppu, int line) {
@@ -2292,7 +2295,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
             const bool ws_clip_left =
                 ws_edge_clip_on && ppu->wsOamLeftHintStrict &&
                 !(ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7))) &&
-                ppu->wsOamMotionGrace[slot] == 0;
+                !(ppu->wsOamMotionGraceOn && ppu->wsOamMotionGrace[slot]);
            PpuOverlayCapture *obj_capture =
                 &ppu->overlayCaptures[kPpuOverlaySource_Obj];
             bool capture_slot = PpuOverlayActiveOnLine(

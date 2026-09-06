@@ -250,6 +250,12 @@ struct Ppu {
   // NMI after CPU-side OAM staging is final and before the frame is presented.
   // A NULL hint pointer disables strict mode. Pass a zeroed array for strict
   // mode with no slots marked.
+  // Host switch for the temporal fallback below. 1 (the default) lets an
+  // unhinted moving OBJ into the margins; 0 admits ONLY hinted slots.
+  // Screens whose margin content the host can enumerate exactly should
+  // turn it off -- a heuristic there shows sprites while the screen moves
+  // and hides them when it stops.
+  uint8_t wsOamMotionGraceOn;
   uint8_t wsOamLeftHintStrict;
   uint8_t wsOamLeftHint[16];
   uint8_t wsOamRightHintStrict;
